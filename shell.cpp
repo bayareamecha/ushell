@@ -27,6 +27,7 @@ SOFTWARE.
 #include <Adafruit_I2CDevice.h>
 #include <Adafruit_BusIO_Register.h>
 #include <Arduino.h>
+#include <string.h>
 
 #include <Adafruit_GFX.h>  // Core graphics library
 #include "Adafruit_ThinkInk.h"
@@ -43,6 +44,116 @@ SOFTWARE.
 #define I2C_ADDRESS 0x5F
 Adafruit_I2CDevice i2c_dev = Adafruit_I2CDevice(I2C_ADDRESS);
 ThinkInk_290_Grayscale4_T5 display(EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY);
+
+
+namespace {
+constexpr unsigned long DISPLAY_REFRESH_INTERVAL_MS = 5000UL;
+constexpr uint8_t TERMINAL_TEXT_SIZE = 1;
+constexpr uint8_t TERMINAL_CHAR_WIDTH = 6 * TERMINAL_TEXT_SIZE;
+constexpr uint8_t TERMINAL_CHAR_HEIGHT = 8 * TERMINAL_TEXT_SIZE;
+constexpr uint8_t TERMINAL_COLS = 296 / TERMINAL_CHAR_WIDTH;
+constexpr uint8_t TERMINAL_ROWS = 128 / TERMINAL_CHAR_HEIGHT;
+
+char terminalLines[TERMINAL_ROWS][TERMINAL_COLS + 1];
+uint8_t terminalLineLengths[TERMINAL_ROWS];
+uint8_t terminalCurrentRow = 0;
+uint8_t terminalCurrentCol = 0;
+unsigned long lastDisplayRefresh = 0;
+bool displayDirty = false;
+
+void clearTerminalLine(uint8_t row)
+{
+    memset(terminalLines[row], ' ', TERMINAL_COLS);
+    terminalLines[row][TERMINAL_COLS] = '\0';
+    terminalLineLengths[row] = 0;
+}
+
+void terminalNewLine()
+{
+    terminalCurrentCol = 0;
+
+    if (terminalCurrentRow < TERMINAL_ROWS - 1) {
+        terminalCurrentRow++;
+        clearTerminalLine(terminalCurrentRow);
+        return;
+    }
+
+    for (uint8_t row = 1; row < TERMINAL_ROWS; row++) {
+        memcpy(terminalLines[row - 1], terminalLines[row], TERMINAL_COLS + 1);
+        terminalLineLengths[row - 1] = terminalLineLengths[row];
+    }
+
+    clearTerminalLine(TERMINAL_ROWS - 1);
+}
+
+void terminalPutChar(char ch)
+{
+    if (ch == '\r') {
+        terminalCurrentCol = 0;
+        displayDirty = true;
+        return;
+    }
+
+    if (ch == '\n') {
+        terminalNewLine();
+        displayDirty = true;
+        return;
+    }
+
+    if (ch == '\b' || ch == 0x7F) {
+        if (terminalCurrentCol > 0) {
+            terminalCurrentCol--;
+            terminalLines[terminalCurrentRow][terminalCurrentCol] = ' ';
+            terminalLineLengths[terminalCurrentRow] = terminalCurrentCol;
+        }
+        displayDirty = true;
+        return;
+    }
+
+    if (terminalCurrentCol >= TERMINAL_COLS) {
+        terminalNewLine();
+    }
+
+    terminalLines[terminalCurrentRow][terminalCurrentCol++] = ch;
+    if (terminalCurrentCol > terminalLineLengths[terminalCurrentRow]) {
+        terminalLineLengths[terminalCurrentRow] = terminalCurrentCol;
+    }
+    displayDirty = true;
+}
+
+void terminalRefresh(bool force = false)
+{
+    const unsigned long now = millis();
+    if (!force && (!displayDirty || now - lastDisplayRefresh < DISPLAY_REFRESH_INTERVAL_MS)) {
+        return;
+    }
+
+    display.clearBuffer();
+    display.setTextSize(TERMINAL_TEXT_SIZE);
+    display.setTextColor(EPD_BLACK);
+
+    for (uint8_t row = 0; row < TERMINAL_ROWS; row++) {
+        display.setCursor(0, row * TERMINAL_CHAR_HEIGHT);
+        for (uint8_t col = 0; col < terminalLineLengths[row]; col++) {
+            display.print(terminalLines[row][col]);
+        }
+    }
+
+    display.display();
+    lastDisplayRefresh = now;
+    displayDirty = false;
+}
+
+void terminalInit()
+{
+    for (uint8_t row = 0; row < TERMINAL_ROWS; row++) {
+        clearTerminalLine(row);
+    }
+    terminalCurrentRow = 0;
+    terminalCurrentCol = 0;
+    displayDirty = true;
+}
+}
 
 // non-blocking read interface
 static int ush_read(struct ush_object *self, char *ch)
@@ -93,22 +204,8 @@ static int ush_read(struct ush_object *self, char *ch)
 // non-blocking write interface
 static int ush_write(struct ush_object *self, char ch)
 {
-    display.setTextColor(EPD_BLACK);
-    display.setCursor(display.getCursorX(), display.getCursorY());
-    display.print(ch);
-    Serial.print(ch);
-
-  //  return (Wire.write(ch) == 1);
-    // should be implemented as a FIFO
-
-        if (ch == '\n') {
-        display.display(); // Update the display on newline
-    }
-    return 1; // Return success
-   return (Serial.write(ch) == 1);
-  //  return (Serial.print(ch) == 1); // Print to Serial for debugging/output
-        // should be implemented as a FIFO
-   // return (Keyboard.write(ch) == 1);
+    terminalPutChar(ch);
+    return (Serial.write(ch) == 1);
 }
 
 // I/O interface descriptor
@@ -157,15 +254,10 @@ void shell_init(void)
     Wire.begin();
 
     display.begin(THINKINK_GRAYSCALE4);
-    display.clearBuffer();
-    display.display();
+    terminalInit();
+    terminalRefresh(true);
 
 //    Keyboard.begin();
-
-    // Initialize the EPD display
-    display.begin(THINKINK_GRAYSCALE4);
-    display.clearBuffer();
-    display.display(); // Show a blank screen initially
 
     // initialize microshell instance
     ush_init(&ush, &ush_desc);
@@ -179,21 +271,8 @@ void shell_init(void)
     shell_bin_mount();
 }
 
-void displayCommandLine(char ch) {
-    display.clearBuffer();
-    display.setTextSize(1.5);
-    display.setTextColor(EPD_BLACK);
-    display.print(ch);
-    display.display();
-}
-
-
 void shell_service(void)
-{/*
-    if (updateDisplay) {
-        displayCommandLine(); // Display the updated command line
-        updateDisplay = false; // Reset the flag
-    }
-    */
+{
     ush_service(&ush);
+    terminalRefresh();
 }
